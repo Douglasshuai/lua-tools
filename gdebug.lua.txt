@@ -1,359 +1,579 @@
-local sformat = string.format
-local tconcat = table.concat
-local tinsert = table.insert
-local tostring = tostring
-local srep = string.rep
+debugger = {}
+debugger.funcbreakpoints = {}
+debugger.linebreakpoints = {}
+debugger.luacode = {}
+debugger.command = {}
+debugger.idgenerator = 0
 
-local stack_level
-local in_hooking = false
-local quit_debug = false
-local hk_base_level = 6
-local gdb_base_level = 4
+debugger.generatebreakpointid = function()
+    debugger.idgenerator = debugger.idgenerator + 1
+    return debugger.idgenerator
+end
 
-local cur_list_file
-local cur_list_line
-local last_list_line
+debugger.addfuncbreak = function(fun)
+    assert(type(fun) == "function", "must be a function")
 
-local function list_source_codes(file, start_line, follow_line)
-    if not start_line then
+    local id = debugger.generatebreakpointid()
+    debugger.funcbreakpoints[fun] = id
+    debugger.setnormalmode()
 
-        if not last_list_line then
-            start_line = cur_list_line
-        else
-            start_line = last_list_line + 1
-        end
+    print(string.format("id: %d, function break point added: ", id), fun)
+end
 
-    end
+debugger.delfuncbreak = function(fun)
+    assert(type(fun) == "function", "must be a function")
 
-    follow_line = follow_line or 5
-
-    local end_line = start_line + follow_line - 1
-
-    local line_num = 1
-    for context in io.lines(file) do
-        if line_num >= start_line then
-            print(line_num, ":", context)
-            last_list_line = line_num
-        end
-        if line_num >= end_line then
-            break
-        end
-        line_num = line_num + 1
+    if debugger.funcbreakpoints[fun] then
+        local id = debugger.funcbreakpoints[fun]
+        debugger.funcbreakpoints[fun] = nil
+        print(string.format("id: %d, function break point deleted", id), fun)
+    else
+        print("no break point:", fun)
     end
 end
 
-local function tostring_r(root)
-    if type(root) ~= "table" then
-        return tostring(root)
+debugger.printfuncbreak = function()
+    for fun, id in pairs(debugger.funcbreakpoints) do
+        print(string.format("id: %d ", id), fun)
     end
-    local cache = { [root] = "." }
-    local function _dump(t, space, name)
-        local temp = {}
-        for k, v in pairs(t) do
-            local key = tostring(k)
-            if cache[v] then
-                tinsert(temp, "+" .. key .. " {" .. cache[v] .. "}")
-            elseif type(v) == "table" then
-                local new_key = name .. "." .. key
-                cache[v] = new_key
-                tinsert(temp, "+" .. key .. _dump(v, space .. (next(t, k) and "|" or " ") .. srep(" ", #key), new_key))
-            else
-                tinsert(temp, "+" .. key .. " [" .. tostring(v) .. "]")
-            end
-        end
-        return tconcat(temp, "\n"..space)
-    end
-    return _dump(root, "","")
 end
 
-local function find_var(level, varname)
-    local i = -1
-    while true do
-        local name, v = debug.getlocal(level, i)
-        if name == nil then
-            break
-        end
-        if varname == name then
-            return v
-        end
-        i = i - 1
+debugger.addlinebreak = function(file, line)
+    if not debugger.linebreakpoints[file] then
+        debugger.linebreakpoints[file] = {}
     end
 
-    i = 1
-    while true do
-        local name, v = debug.getlocal(level, i)
-        if name == nil then
-            break
-        end
-        if varname == name then
-            return v
-        end
-        i = i + 1
-    end
+    local id = debugger.generatebreakpointid()
+    debugger.linebreakpoints[file][line] = id
+    debugger.setnormalmode()
 
-    local info = debug.getinfo(level, "f")
-    if not info then
+    print(string.format("id: %d, line break point [%s]:%d added", id, string.sub(file, 2), line))
+end
+
+debugger.dellinebreak = function(file, line)
+    if debugger.linebreakpoints[file] and debugger.linebreakpoints[file][line] then
+        local id = debugger.linebreakpoints[file][line]
+        debugger.linebreakpoints[file][line] = nil
+        print(string.format("id: %d, line break point [%s]:%d deleted", id, file, line))
         return
     end
 
-    i = 1
-    while true do
-        local name, v = debug.getupvalue(info.func, i)
-        if name == nil then
-            break
+    print(string.format("no break point: [%s]:%d", file, line))
+end
+
+debugger.printlinebreak = function()
+    for file, lines in pairs(debugger.linebreakpoints) do
+        for line, id in pairs(lines) do
+            print(string.format("id: %d [%s]:%d", id, file, line))
         end
-        if varname == name then
-            return v
-        end
-        i = i + 1
+    end
+end
+
+debugger.clearbreakpoint = function()
+    debugger.funcbreakpoints = {}
+    debugger.linebreakpoints = {}
+end
+
+debugger.loadluacode = function(filename)
+    local file, errormsg = io.open(filename)
+    if not file then
+        print(errormsg)
+        return
     end
 
-    return _ENV[varname]
+    local code = {}
+    for line in file:lines() do
+        table.insert(code, line)
+    end
+
+    debugger.luacode[filename] = code
+    file:close()
 end
 
-local function reply(s, ...)
-    s = "gdb>" .. s
-    print(sformat(s, ...))
+debugger.printluacode = function(file, line, ll)
+    if not debugger.luacode[file] then
+        debugger.loadluacode(file)
+    end
+
+    local code = debugger.luacode[file]
+    if not code then
+        return
+    end
+
+    local beginline = (line - ll) < 1 and 1 or (line - ll)
+    local endline = (line + ll) > #code and #code or (line + ll)
+
+    for i = beginline, endline do
+        print(i, code[i])
+    end
 end
 
-local gdb_cmd = {}
+debugger.setnormalmode = function()
+    debug.sethook(debugger.normalmodehook, "cl")
+end
 
-local function dispatch_input()
-    while true do
-        local c = io.read()
-        local cc, param
-        if gdb_cmd[c] then
-            cc = c
-        elseif #c > 1 and gdb_cmd[c:sub(1,1)] then
-            cc = c:sub(1, 1)
-            param = c:sub(3)
-        end
-        if cc then
-            local ok, err = pcall(gdb_cmd[cc], param) --main
-            if ok then
-                if err then
-                    break
+debugger.setstepinmode = function()
+    debug.sethook(debugger.stepinmodehook, "l")
+end
+
+debugger.setstepovermode = function()
+    debug.sethook(debugger.stepovermodehook, "crl")
+end
+
+debugger.setnextlinemode = function()
+
+    debug.sethook(debugger.nextlinemodehook, "crl")
+
+end
+
+debugger.checkbreakline = function(stacklevel, onbreak)
+
+    local info = debug.getinfo(stacklevel, "Sl")
+
+    for file, lines in pairs(debugger.linebreakpoints) do
+        if file == info.source then
+            for line, _ in pairs(lines) do
+                if line == info.currentline then
+                    if onbreak then onbreak() end
+                    debugger.breakthepoint(stacklevel + 1)
                 end
-            else
-                reply("cmd:[%s] err:%s", cc, err)
             end
-        elseif c == "" then --empty
-            gdb_cmd.l(true)
+        end
+    end
+end
+
+debugger.checkbreakfunc = function(stacklevel, onbreak)
+    local info = debug.getinfo(stacklevel, "f")
+    for fun, _ in pairs(debugger.funcbreakpoints) do
+        if fun == info.func then
+            if onbreak then onbreak() end
+            -- enter step in mode
+            debugger.setstepinmode()
+        end
+    end
+end
+
+debugger.normalmodehook = function(event, line)
+    if event == "line" then
+        debugger.checkbreakline(3)
+    elseif event == "call" then
+        debugger.checkbreakfunc(3)
+    end
+end
+
+debugger.stepinmodehook = function(event, line)
+    debugger.breakthepoint(3)
+end
+
+debugger.stepovermodehook = function(event, line)
+    local onbreak = function()
+        debugger.stepoverbreak = nil
+        debugger.callfunctimes = nil
+    end
+
+    if event == "line" then
+        debugger.checkbreakline(3, onbreak)
+
+        if debugger.stepoverbreak and debugger.callfunctimes == 0 then
+            onbreak()
+            debugger.breakthepoint(3)
+        end
+    elseif event == "call" then
+        debugger.checkbreakfunc(3, onbreak)
+
+        if debugger.stepoverbreak then
+            debugger.callfunctimes = debugger.callfunctimes + 1
+        end
+    elseif event == "return" then
+        if debugger.stepoverbreak then
+            debugger.callfunctimes = debugger.callfunctimes - 1
+        end
+    end
+end
+
+debugger.nextlinemodehook = function(event, line)
+    local onbreak = function()
+        debugger.nextlinebreak = nil
+        debugger.callfunctimes = nil
+    end
+
+    if event == "line" then
+
+        debugger.checkbreakline(3, onbreak)
+
+        if debugger.nextlinebreak and debugger.callfunctimes <= 1 then
+            onbreak()
+            debugger.breakthepoint(3)
+        end
+    elseif event == "call" then
+        debugger.checkbreakfunc(3, onbreak)
+
+        if debugger.nextlinebreak then
+            debugger.callfunctimes = debugger.callfunctimes + 1
+        end
+    elseif event == "return" then
+        if debugger.nextlinebreak then
+            debugger.callfunctimes = debugger.callfunctimes - 1
+        end
+    end
+end
+
+debugger.start = function()
+	debugger.breakthepoint(3, 1)
+end
+
+debugger.breakthepoint = function(stacklevel, notprintcode)
+    if not notprintcode then
+        -- print currentline code
+        local info = debug.getinfo(stacklevel, "Sl")
+    	local file = "../../ProductionSceneServer/Assets/Bytes/Lua/" .. info.short_src .. ".lua.txt"
+        debugger.printluacode(file, info.currentline, 0)
+    end
+
+    -- get command input
+    print("debugger >")
+    local l = io.read("*l")
+    local command = debugger.parsecommand(l)
+    debugger.execute(command, stacklevel + 1)
+end
+
+debugger.parsecommand = function(commandline)
+    local t = {}
+    for w in string.gmatch(commandline, "[^ ]+") do
+        table.insert(t, w)
+    end
+
+    return t
+end
+
+debugger.execute = function(command, stacklevel)
+    local executor = debugger.command[command[1]]
+    if not executor then
+        debugger.errorcmd()
+        debugger.breakthepoint(stacklevel + 1)
+    else
+        executor(command, stacklevel + 1)
+    end
+end
+
+debugger.breakline = function(command, stacklevel)
+    local iscurrentfile = tonumber(command[2]) and true or false
+    for i = 2, #command do
+        local errorcmd = false
+        if iscurrentfile and not tonumber(command[i]) then
+            errorcmd = true
+        end
+
+        if not iscurrentfile and math.fmod(i, 2) == 1 and not tonumber(command[i]) then
+            errorcmd = true
+        end
+
+        if errorcmd then
+            return debugger.errorcmd()
+        end
+    end
+
+    if iscurrentfile then
+        local info = debug.getinfo(stacklevel, "S")
+        for i = 2, #command do
+            local line = tonumber(command[i])
+            debugger.addlinebreak(info.source, line)
+        end
+    else
+        for i = 2, #command, 2 do
+            local file = "@" .. command[i]
+            local line = tonumber(command[i + 1])
+            debugger.addlinebreak(file, line)
+        end
+    end
+end
+
+debugger.breakfunc = function(command, stacklevel)
+    for i = 2, #command do
+        local chunk = load(string.format("return %s", command[i]))
+        local func = chunk and chunk() or nil
+
+        if type(func) == "function" then
+            debugger.addfuncbreak(func)
+            print(string.format("break function: %s", command[i]))
         else
-            reply("unknow cmd:" .. c)
+            print(string.format("no function %s, can't break it", command[i]))
         end
     end
 end
 
-local function _hook(event)
-
-    if stack_level then
-        if event == "call" or event == "tail call" then
-            stack_level = stack_level + 1
-        elseif event == "return" then
-            stack_level = stack_level - 1
-        end
-        if stack_level > 0 then
-            return
-        end
-        stack_level = nil
+debugger.breakpoint = function(command, stacklevel)
+    if #command < 2 then
+        debugger.errorcmd()
+        return debugger.breakthepoint(stacklevel + 1)
     end
 
-    if event ~= "line" then
-        return
-    end
+    local isbreakfunc = tonumber(command[2]) and 0 or 1
+    isbreakfunc = (command[3] and tonumber(command[3])) and 0 or isbreakfunc
 
-    local info = debug.getinfo(2, "Sln")
-    if not info.name then
-        reply("%s:%s -> ", info.short_src, info.currentline)
+    if isbreakfunc == 1 then
+        debugger.breakfunc(command, stacklevel + 1)
     else
-        reply("%s:%s -> %s", info.short_src, info.currentline, info.name)
-    end
-    cur_list_line = info.short_src .. ".lua.txt"
-    cur_list_line = info.currentline
-
-    in_hooking = true
-    dispatch_input()
-
-    if quit_debug then
-        return
+        debugger.breakline(command, stacklevel + 1)
     end
 
-    if not in_hooking then
-        reply "Program continue running"
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.continue = function(command, stacklevel)
+    debugger.setnormalmode()
+end
+
+debugger.nextline = function(command, stacklevel)
+
+    debugger.nextlinebreak = true
+    debugger.callfunctimes = 1
+    debugger.setnextlinemode()
+
+end
+
+debugger.stepin = function(command, stacklevel)
+    debugger.setstepinmode()
+end
+
+debugger.stepover = function(command, stacklevel)
+    debugger.stepoverbreak = true
+    debugger.callfunctimes = 1
+    debugger.setstepovermode()
+end
+
+debugger.printline = function(command, stacklevel)
+    local info = debug.getinfo(stacklevel, "Sl")
+    local lines = tonumber(command[2]) or 2
+    local file = "../../ProductionSceneServer/Assets/Bytes/Lua/" .. info.short_src .. ".lua.txt"
+    debugger.printluacode(file, info.currentline, lines)
+
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.getlocalvaluetable = function(stacklevel)
+    local j = 1
+    local t = {}
+    while true do
+        local n, v = debug.getlocal(stacklevel, j)
+        if not n then break end
+
+        t[n] = v
+        j = j + 1
+    end
+
+    return t
+end
+
+debugger.setlocalvaluetable = function(stacklevel, newlocals)
+    local j = 1
+    while true do
+        local n, v = debug.getlocal(stacklevel, j)
+        if not n then break end
+
+        v = newlocals[n]
+        assert(debug.setlocal(stacklevel, j, v) == n)
+        j = j + 1
     end
 end
 
-local function debug_hook(back_level, db_cmd)
-    debug.sethook(function(event, line)
-        if event == "call" or event == "tail call" then
-            back_level = back_level + 1
-        elseif event == "return" then
-            back_level = back_level - 1
-        end
+debugger.getupvaluetable = function(stacklevel)
+    local f = debug.getinfo(stacklevel, "f").func
+    local j = 1
+    local t = {}
+    while true do
+        local n, v = debug.getupvalue(f, j)
+        if not n then break end
 
-        if back_level == 0 then
-            if db_cmd == "next" then
-                stack_level = 0
-                debug.sethook(_hook, "crl")
-            elseif db_cmd == "step" then
-                debug.sethook(_hook, "l")
+        t[n] = v
+        j = j + 1
+    end
+
+    return t
+end
+
+debugger.setupvaluetable = function(stacklevel, newupvalues)
+    local f = debug.getinfo(stacklevel, "f").func
+    local j = 1
+    while true do
+        local n, v = debug.getupvalue(f, j)
+        if not n then break end
+
+        v = newupvalues[n]
+        assert(debug.setupvalue(f, j, v) == n)
+        j = j + 1
+    end
+end
+
+debugger.getfuncenvtable = function(stacklevel)
+    local fenv = getfenv(stacklevel)
+    local upvaluetable = debugger.getupvaluetable(stacklevel + 1)
+    setmetatable(upvaluetable, { __index = function(t, k) return fenv[k] end })
+
+    local localvaluetable = debugger.getlocalvaluetable(stacklevel + 1)
+    setmetatable(localvaluetable, { __index = function(t, k) return upvaluetable[k] end,
+                                    __newindex = function() assert(false) end })
+    return localvaluetable, upvaluetable, fenv
+end
+
+debugger.printvar = function(command, stacklevel)
+
+    local getvalue = function(name, stacklevel)
+        local chunk = load(string.format("return %s", name))
+        if chunk then
+            setfenv(chunk, debugger.getfuncenvtable(stacklevel + 1))
+            local value = { pcall(chunk) }
+            if value[1] then
+                table.remove(value, 1)
+                if #value ~= 0 then
+                    return name, value
+                end
             end
         end
-    end, "cr")
+
+        return name, nil
+    end
+
+    for i = 2, #command do
+        local n, v = getvalue(command[i], stacklevel + 1)
+        if type(v) == "table" then
+            print(n, table.unpack(v))
+        else
+            print(n, v)
+        end
+    end
+
+    debugger.breakthepoint(stacklevel + 1, true)
 end
 
-function gdb_cmd.h()
-    reply[[
-        s : run step
-        n : run next
-        r : run until return
-        l : show below codes
-        p var : print var
-        c : continue to next breakpoint
-        h : help message
-        bt : show stack frame
-        f level : show locals at level frame
-        q : quit interactive mode
+debugger.traceback = function(command, stacklevel)
+    local level = stacklevel
+    while true do
+        local info = debug.getinfo(level, "Sl")
+        if not info then break end
+
+        print(string.format("[%s]:%d", info.short_src, info.currentline))
+        level = level + 1
+    end
+
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.printbreakpoint = function(command, stacklevel)
+    debugger.printfuncbreak()
+    debugger.printlinebreak()
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.clearbreak = function(command, stacklevel)
+    debugger.clearbreakpoint()
+    print("clear all break points ok")
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.deletebreak = function(command, stacklevel)
+    local getfuncbreakpoint = function(breakpointid)
+        for func, id in pairs(debugger.funcbreakpoints) do
+            if id == breakpointid then
+                return func
+            end
+        end
+    end
+
+    local getlinebreakpoint = function(breakpointid)
+        for file, lines in pairs(debugger.linebreakpoints) do
+            for line, id in pairs(lines) do
+                if id == breakpointid then
+                    return file, line
+                end
+            end
+        end
+    end
+
+    for i = 2, #command do
+        local id = tonumber(command[i])
+        if id then
+            local func = getfuncbreakpoint(id)
+            if func then
+                debugger.delfuncbreak(func)
+            else
+                local file, line = getlinebreakpoint(id)
+                if file and line then
+                    debugger.dellinebreak(file, line)
+                end
+            end
+        end
+    end
+
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.dosetvalue = function(command, stacklevel)
+    local setcommand = string.format("%s = %s", command[2], command[3])
+    local chunk = load(setcommand)
+
+    if chunk then
+        local localvaluetable, upvaluetable = debugger.getfuncenvtable(stacklevel + 1)
+        setfenv(chunk, localvaluetable)
+        if pcall(chunk) then
+            debugger.setlocalvaluetable(stacklevel + 1, localvaluetable)
+            debugger.setupvaluetable(stacklevel + 1, upvaluetable)
+            return setcommand .. " ok"
+        end
+    end
+
+    return setcommand .. " failed"
+end
+
+debugger.setvalue = function(command, stacklevel)
+    if #command < 3 then
+        debugger.errorcmd()
+        return debugger.breakthepoint(stacklevel + 1)
+    end
+
+    local msg = debugger.dosetvalue(command, stacklevel + 1)
+    print(msg)
+    debugger.breakthepoint(stacklevel + 1, true)
+end
+
+debugger.help = function(command, stacklevel)
+    local str = [[
+        b   --   break line. eg. b file line ...
+                 current file: eg. b line line ...
+        c   --   continue
+        n   --   next line
+        s   --   step in
+        o   --   step over
+        l   --   print context lua code. eg. l [lines]
+        p   --   print var value. eg. p var1 var2 ...
+        t   --   traceback
+        pb  --   print all break points
+        cb  --   clear all break points
+        db  --   delete break point. eg. db id1 id2 ...
+        set --   set value. eg. set var value
+        h   --   for help
     ]]
+
+    print(str)
+    debugger.breakthepoint(stacklevel + 1, true)
 end
 
-function gdb_cmd.l(enter_cmd)
-    if enter_cmd then
-        list_source_codes(cur_list_file)
-    else
-        list_source_codes(cur_list_file, cur_list_line)
-    end
+debugger.errorcmd = function()
+    print("error command, h for help")
 end
 
-function gdb_cmd.p( name )
-    if not name or #name == 0 then
-        reply "need a var name"
-        return
-    end
-    local var = find_var(gdb_base_level + 2, name)
-    reply(tostring_r(var))
-end
+debugger.command["b"] = debugger.breakpoint
+debugger.command["c"] = debugger.continue
+debugger.command["n"] = debugger.nextline
+debugger.command["s"] = debugger.stepin
+debugger.command["o"] = debugger.stepover
+debugger.command["l"] = debugger.printline
+debugger.command["p"] = debugger.printvar
+debugger.command["t"] = debugger.traceback
+debugger.command["pb"] = debugger.printbreakpoint
+debugger.command["cb"] = debugger.clearbreak
+debugger.command["db"] = debugger.deletebreak
+debugger.command["set"] = debugger.setvalue
+debugger.command["h"] = debugger.help
 
-function gdb_cmd.bt()
-    local i = 1
-    local tmp = {}
-    while true do
-        local info = debug.getinfo(gdb_base_level + 1, "Sl")
-        if info == nil then
-            break
-        end
-        local source = sformat("[%d] %s:%d", i, info.short_src, info.currentline)
-        tinsert(tmp, source)
-        i = i + 1
-    end
-    reply(tconcat(tmp, "\n"))
-end
-
-function gdb_cmd.f(level)
-    level = level or 1
-    local s = gdb_base_level +level
-    local info = debug.getinfo(s, "uf")
-    local tmp = {}
-    for i = 1, info.nparams do
-        local name, value = debug.getlocal(s, i)
-        tinsert(tmp, sformat("P %s : %s", name, tostring_r(value)))
-    end
-    if info.isvararg then
-        local index = -1
-        while true do
-            local name, value = debug.getlocal(s, index)
-            if name == nil then
-                break
-            end
-            tinsert(tmp, sformat("P [%d] : %s", -index, tostring_r(value)))
-            index = index - 1
-        end
-    end
-    local index = info.nparams + 1
-    while true do
-        local name, value = debug.getlocal(s, index)
-        if name == nil then
-            break
-        end
-        tinsert(tmp, sformat("L %s : %s", name, tostring_r(value)))
-        index = index + 1
-    end
-    for i = 1, info.nups do
-        local name, value = debug.getupvalue(info.func, i)
-        if name ~= "_ENV" then
-            tinsert(tmp, sformat("U %s : %s", name, tostring_r(value)))
-        end
-    end
-
-    reply(tconcat(tmp, "\n"))
-end
-
-function gdb_cmd.n()
-    if in_hooking then
-        stack_level = 0
-        debug.sethook(_hook, "crl")
-    else
-        debug_hook(hk_base_level, "next")
-    end
-    return true
-end
-
-function gdb_cmd.s()
-    if in_hooking then
-        debug.sethook(_hook, "l")
-    else
-        debug_hook(hk_base_level, "step")
-    end
-    return true
-end
-
-function gdb_cmd.q()
-    in_hooking = false
-    debug.sethook()
-    quit_debug = true
-    return true
-end
-
-function gdb_cmd.c()
-    in_hooking = false
-    debug.sethook()
-    return true
-end
-
-function gdb_cmd.r()
-    if in_hooking then
-        debug_hook(1, "step")
-    else
-        debug_hook(1 + hk_base_level, "step")
-    end
-    return true
-end
-
-local M = {}
-
-function M.bp()
-
-    if quit_debug then
-        return
-    end
-
-    local info = debug.getinfo(2, "Sln")
-    if not info.name then
-    	reply("%s:%s> ", info.short_src, info.currentline)
-    else
-    	reply("%s:%s> %s", info.short_src, info.currentline, info.name)
-    end
-
-    cur_list_file = "../../ProductionSceneServer/Assets/Bytes/Lua/" .. info.short_src .. ".lua.txt"
-    cur_list_line = info.currentline
-
-    if in_hooking then
-        debug.sethook()
-        in_hooking = false
-    end
-
-    dispatch_input()
-end
-
-return M
+return debugger
